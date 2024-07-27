@@ -1,0 +1,11 @@
+ngx_addon_name=ngx_http_redis_module
+
+ngx_module_type=HTTP
+ngx_module_name="$ngx_addon_name"
+ngx_module_srcs="$ngx_addon_dir/${ngx_addon_name}.c $ngx_addon_dir/lib/ngx_buddy.c $ngx_addon_dir/lib/ngx_redis_cache.c"
+
+NGX_ADDON_DEPS="${NGX_ADDON_DEPS} ${ngx_addon_dir}/include/ngx_http_redis_module.h ${ngx_addon_dir}/lib/include/ngx_buddy.h"
+NGX_ADDON_DEPS="${NGX_ADDON_DEPS} ${ngx_addon_dir}/lib/include/ngx_redis_common.h ${ngx_addon_dir}/lib/include/ngx_redis_cache.h"
+CFLAGS="${CFLAGS} -I${ngx_addon_dir}/include -I${ngx_addon_dir}/lib/include"
+
+. auto/module
