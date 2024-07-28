@@ -727,14 +727,15 @@ _read_len:
     h->value = redis_cf->redis_content_type; /* 从配置中获取响应类型 */
     h->lowcase_key = (u_char *)"content-type";
 
-    h = ngx_list_push(&us->headers_in.headers);
-    if(h == NULL) {
-        return NGX_ERROR;
-    }
-    h->hash = _hash_str("connection");
-    ngx_str_set(&h->key, "Connection");
-    ngx_str_set(&h->value, "close");
-    h->lowcase_key = (u_char *)"connection";
+    /* h = ngx_list_push(&us->headers_in.headers); */
+    /* if(h == NULL) { */
+    /*     return NGX_ERROR; */
+    /* } */
+    /* h->hash = _hash_str("connection"); */
+    /* ngx_str_set(&h->key, "Connection"); */
+    /* ngx_str_set(&h->value, "close"); */
+    /* h->lowcase_key = (u_char *)"connection"; */
+    us->keepalive = 1;
 
     return NGX_OK;
 }
@@ -814,10 +815,13 @@ http_redis_upstream_filter(void *data, ssize_t bytes)
 
     u->length -= bytes;     /* 更新响应体的剩余长度 */
     if(u->length <= 0) {
+        u->length = 0;
         if(rcn) {
             ngx_redis_cache_insert(ctx->rlcf->nr, rcn);
         }
         cl->buf->last -= 2; /* 修复 redis \r\n 结束的问题 */
+        u->keepalive = 1;
+        /* ngx_close_connection(u->peer.connection); */
     }
 
     return NGX_OK;
