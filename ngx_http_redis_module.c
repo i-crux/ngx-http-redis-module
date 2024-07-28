@@ -813,8 +813,11 @@ http_redis_upstream_filter(void *data, ssize_t bytes)
     cl->buf->tag = u->output.tag;
 
     u->length -= bytes;     /* 更新响应体的剩余长度 */
-    if(u->length <= 0 && rcn) {
-        ngx_redis_cache_insert(ctx->rlcf->nr, rcn);
+    if(u->length <= 0) {
+        if(rcn) {
+            ngx_redis_cache_insert(ctx->rlcf->nr, rcn);
+        }
+        cl->buf->last -= 2; /* 修复 redis \r\n 结束的问题 */
     }
 
     return NGX_OK;
