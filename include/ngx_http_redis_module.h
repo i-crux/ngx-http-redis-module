@@ -98,7 +98,8 @@ typedef struct redis_module_req_ctx_s {
     ngx_int_t                           vallen;
     u_char                              buf[_MAXLINE];  /* 解析redis响应使用的buff */
     ngx_http_redis_module_loc_conf_t    *rlcf;
-    ngx_redis_cache_node_t              *rcn;
+    ngx_str_t                           redis_value;
+    /* ngx_redis_cache_node_t              *rcn; */
 } redis_module_req_ctx_t;
 
 

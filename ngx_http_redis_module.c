@@ -260,6 +260,9 @@ http_redis_create_loc_conf(ngx_conf_t *cf)
     redis_cf->upconf.buffering = 0;
     redis_cf->upconf.bufs.num = 8;
     redis_cf->upconf.bufs.size = ngx_pagesize;
+    /* 
+     * TODO: 改成可配置项
+     */
     redis_cf->upconf.buffer_size = ngx_pagesize;
     redis_cf->upconf.busy_buffers_size = 2 * ngx_pagesize;
     redis_cf->upconf.temp_file_write_size = 2 * ngx_pagesize;
@@ -582,13 +585,16 @@ _try_again:
         v->len = value->len;
         v->data = (u_char *)v + sizeof(ngx_str_t);
         rcn->cache.value = v;
-        /* ngx_memcpy(v->data, value->data, value->len); */
+        ngx_memcpy(v->data, value->data, value->len);
     }
     rcn->rbt_node.key = _msec_now;
 
     return rcn;
 }
 
+/**
+ * 本地缓存在redis中未命中的缓存
+ */
 static inline void 
 _redis_cached_miss(redis_module_req_ctx_t *rctx)
 {
@@ -600,6 +606,27 @@ _redis_cached_miss(redis_module_req_ctx_t *rctx)
     }
 
     ngx_redis_cache_insert(redis_cf->nr, rcn);
+}
+
+static inline ngx_redis_cache_node_t *
+_check_local_cache(redis_module_req_ctx_t *rctx)
+{
+    ngx_http_redis_module_loc_conf_t    *redis_cf = rctx->rlcf;
+    /* ngx_http_request_t                  *r = rctx->request; */
+    ngx_redis_cache_node_t              *rcn = ngx_redis_cache_find(redis_cf->nr, &rctx->rediskey);
+    
+    if(rcn == NULL) {   /* 没有找到缓存 */
+        /* ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "redis cache not found: %V", &rctx->rediskey); */
+        return NULL;
+    }
+    if(_msec_now - rcn->rbt_node.key > redis_cf->cacheto) {     /* 缓存超时 */
+        /* ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "redis cache timeout: %V, %M, %M",  */
+        /*               &rctx->rediskey, _msec_now, rcn->rbt_node.key); */
+        ngx_redis_cache_delete(redis_cf->nr, rcn);
+        ngx_buddy_free(redis_cf->nb, rcn);
+        return NULL;
+    }
+    return rcn;
 }
 
 /**
@@ -615,8 +642,8 @@ http_redis_upstream_process_header(ngx_http_request_t *r)
     ngx_http_redis_module_loc_conf_t    *redis_cf; 
     ngx_buf_t                           *b;
     ngx_table_elt_t                     *h;
-    ngx_redis_cache_node_t              *rcn;
-    ngx_str_t                           v = ngx_null_string;
+    /* ngx_redis_cache_node_t              *rcn; */
+    /* ngx_str_t                           v = ngx_null_string; */
 
     /* 获取请求上下文 */
     rctx = ngx_http_get_module_ctx(r, ngx_http_redis_module);
@@ -686,8 +713,11 @@ _read_len:
         rctx->vallen = (rctx->vallen == -1 ? -2 : rctx->vallen);
         if(rctx->vallen < 0) {
             _set_httpstatus_contenlen(us, 0, NGX_HTTP_NOT_FOUND);
-            if(rctx->rlcf->cache && rctx->rlcf->cachemiss) {
-                _redis_cached_miss(rctx);
+            if(rctx->rlcf->cachemiss) {   /* 将cache 和 cachemiss 功能分开 */
+                /* 在插入未命中本地缓存时,也需要查询缓存是否存在 */
+                if(!_check_local_cache(rctx)) {
+                    _redis_cached_miss(rctx);
+                }
             }
             b->pos = b->last;
             return NGX_OK;
@@ -702,11 +732,15 @@ _read_len:
     /* 给 upstream->headers_in 赋值 */
     _set_httpstatus_contenlen(us, rctx->vallen, NGX_HTTP_OK);
 
+    /**
+     * 在上下文中保存响应体
+     */
     if(redis_cf->cache) {   /* 使用本地cache  */
-        v.len = rctx->vallen;
-        rcn = _init_rcn(rctx, &v);
-        rctx->rcn = rcn;
-        /* ngx_log_error(NGX_LOG_ERR, rctx->request->connection->log, 0, "allocated node for redis cache : %V", &rcn->cache.key); */
+        rctx->redis_value.len = rctx->vallen;
+        rctx->redis_value.data = ngx_pcalloc(r->pool, rctx->vallen+1);
+        if(rctx->redis_value.data == NULL) {
+            return NGX_ERROR;
+        }
     }
 
     h = ngx_list_push(&us->headers_in.headers);
@@ -772,12 +806,12 @@ http_redis_upstream_filter(void *data, ssize_t bytes)
 {
     redis_module_req_ctx_t  *ctx = data;
 
-    ngx_redis_cache_node_t  *rcn = ctx->rcn;
+    ngx_redis_cache_node_t  *rcn;
     u_char                  *last;
     ngx_buf_t               *b;
     ngx_chain_t             *cl, **ll;
     ngx_http_upstream_t     *u;
-    ngx_str_t               *v;
+    ngx_str_t               *v = &ctx->redis_value;
     off_t                   o;
     size_t                  s;
 
@@ -799,13 +833,14 @@ http_redis_upstream_filter(void *data, ssize_t bytes)
 
     *ll = cl;       /* 新分配的buf结构添加到链表末尾 */
 
-    if(rcn) {
-        v = rcn->cache.value;
-        o = v->len - u->length;
+    /* 
+     * v->len 不为0, 则在 http_redis_upstream_process_header 中经过判断需要缓存
+     * 将redis的响应体拷贝到请求上下文中
+     */
+    if(v->len) {
+        o = v->len - u->length;     /* u->length 保存的是剩余的 响应体长度 */
         s = (size_t)(bytes + o) < v->len ? bytes : u->length;
         ngx_memcpy(v->data + o, b->last, s);
-        /* ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0, "using redis cache for: %V, %p, %p, %z, %V" ,  */
-        /*               &rcn->cache.key, rcn, v, v->len, v); */
     }
     last = b->last;
     cl->buf->pos = last;
@@ -816,8 +851,21 @@ http_redis_upstream_filter(void *data, ssize_t bytes)
     u->length -= bytes;     /* 更新响应体的剩余长度 */
     if(u->length <= 0) {
         u->length = 0;
-        if(rcn) {
-            ngx_redis_cache_insert(ctx->rlcf->nr, rcn);
+        if(ctx->redis_value.len) {   /* 启用了本地缓存 */
+            /**
+             * 解释一下为什么在这里处理本地缓存:
+             * 1. nginx是一个异步框架,也就是同时会有多个请求在使用同一个key查询redis
+             *    所以在插入redis本地缓存的时候需要查询下缓存是否已经存在
+             * 2. 我这里设置的redis本地缓存并没有跨进程共享
+             *    所以在读写缓存的时候不需要加锁
+             */
+            rcn = _check_local_cache(ctx); /* 检测本地缓存是否存在 */
+            if(!rcn) {  /* 没找到本地缓存,或者缓存已过期 */
+                rcn = _init_rcn(ctx, &ctx->redis_value);
+                if(rcn) {  /* 内存可能分配失败 */
+                    ngx_redis_cache_insert(ctx->rlcf->nr, rcn);
+                } 
+            }
         }
         cl->buf->last -= 2; /* 修复 redis \r\n 结束的问题 */
         u->keepalive = 1;
@@ -827,26 +875,6 @@ http_redis_upstream_filter(void *data, ssize_t bytes)
     return NGX_OK;
 }
 
-static inline ngx_redis_cache_node_t *
-_check_local_cache(redis_module_req_ctx_t *rctx)
-{
-    ngx_http_redis_module_loc_conf_t    *redis_cf = rctx->rlcf;
-    /* ngx_http_request_t                  *r = rctx->request; */
-    ngx_redis_cache_node_t              *rcn = ngx_redis_cache_find(redis_cf->nr, &rctx->rediskey);
-    
-    if(rcn == NULL) {   /* 没有找到缓存 */
-        /* ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "redis cache not found: %V", &rctx->rediskey); */
-        return NULL;
-    }
-    if(_msec_now - rcn->rbt_node.key > redis_cf->cacheto) {     /* 缓存超时 */
-        /* ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "redis cache timeout: %V, %M, %M",  */
-        /*               &rctx->rediskey, _msec_now, rcn->rbt_node.key); */
-        ngx_redis_cache_delete(redis_cf->nr, rcn);
-        ngx_buddy_free(redis_cf->nb, rcn);
-        return NULL;
-    }
-    return rcn;
-}
 
 static ngx_int_t 
 _send_resp_using_cache(ngx_http_request_t *r, ngx_redis_cache_node_t *rcn, ngx_http_redis_module_loc_conf_t *rlcf) 
@@ -928,7 +956,7 @@ http_redis_module_handler(ngx_http_request_t *r)
     rctx->lenidx = 0;
     rctx->request = r;
     rctx->rlcf = redis_cf;
-    rctx->rcn = NULL;
+    ngx_str_null(&rctx->redis_value);
     /* 将上下文结构与请求关联起来 */
     ngx_http_set_ctx(r, rctx, ngx_http_redis_module);
 
@@ -952,7 +980,7 @@ http_redis_module_handler(ngx_http_request_t *r)
         default:
             return NGX_HTTP_NOT_ALLOWED;
     }
-    if(redis_cf->cache) {
+    if(redis_cf->cache || redis_cf->cachemiss) {
         rcn = _check_local_cache(rctx);
         if(rcn) {
             /* ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "redis local cache found for %V", &rctx->rediskey); */
